@@ -8,8 +8,9 @@ import sys
 import random
 import time
 import json
-import dmc2gym
 import copy
+from dm_control import suite
+from dm_env import specs
 
 import utils
 from logger import Logger
@@ -18,6 +19,75 @@ from video import VideoRecorder
 from curl_sac import CurlSacAgent
 from torchvision import transforms
 
+class DMControlWrapper(gym.Env):
+    """Minimal Gym wrapper around dm_control environments."""
+    def __init__(self, domain_name, task_name, seed=1, from_pixels=False,
+                 height=84, width=84, frame_skip=1, max_episode_steps=1000):
+        self.from_pixels = from_pixels
+        self.height = height
+        self.width = width
+        self.frame_skip = frame_skip
+        self._max_episode_steps = max_episode_steps
+        self.env = suite.load(domain_name=domain_name,
+                              task_name=task_name,
+                              task_kwargs={'random': seed})
+
+        # Action space
+        action_spec = self.env.action_spec()
+        self.action_space = gym.spaces.Box(
+            low=action_spec.minimum,
+            high=action_spec.maximum,
+            dtype=np.float32
+        )
+
+        # Observation space
+        if self.from_pixels:
+            self.observation_space = gym.spaces.Box(
+                low=0,
+                high=255,
+                shape=(3, height, width),
+                dtype=np.uint8
+            )
+        else:
+            obs_spec = self.env.observation_spec()
+            flat_dim = sum(v.shape[0] if len(v.shape) > 0 else 1 for v in obs_spec.values())
+            self.observation_space = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(flat_dim,),
+                dtype=np.float32
+            )
+
+    def seed(self, seed=None):
+        # dm_control relies on task_kwargs during load for random seed
+        #TODO fix the seed
+        pass
+
+    def _get_obs(self, time_step):
+        if self.from_pixels:
+            img = self.env.physics.render(height=self.height, width=self.width, camera_id=0)
+            # dm_control -> (H, W, C), need (C, H, W) for PyTorch
+            return np.transpose(img, (2, 0, 1)).copy()
+        else:
+            obs = time_step.observation
+            return np.concatenate([np.ravel(v) for v in obs.values()])
+
+    def reset(self):
+        self._elapsed_steps = 0
+        time_step = self.env.reset()
+        return self._get_obs(time_step)
+
+    def step(self, action):
+        reward = 0
+        for _ in range(self.frame_skip):
+            time_step = self.env.step(action)
+            self._elapsed_steps += 1
+            reward += time_step.reward or 0
+            if time_step.last() or self._elapsed_steps >= self._max_episode_steps:  # dm_env end of episode
+                break
+        obs = self._get_obs(time_step)
+        done = time_step.last() or (self._elapsed_steps >= self._max_episode_steps)
+        return obs, reward, done, {}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -155,11 +225,10 @@ def main():
     if args.seed == -1: 
         args.__dict__["seed"] = np.random.randint(1,1000000)
     utils.set_seed_everywhere(args.seed)
-    env = dmc2gym.make(
+    env = DMControlWrapper(
         domain_name=args.domain_name,
         task_name=args.task_name,
         seed=args.seed,
-        visualize_reward=False,
         from_pixels=(args.encoder_type == 'pixel'),
         height=args.pre_transform_image_size,
         width=args.pre_transform_image_size,
@@ -187,8 +256,8 @@ def main():
 
     video = VideoRecorder(video_dir if args.save_video else None)
 
-    with open(os.path.join(args.work_dir, 'args.json'), 'w') as f:
-        json.dump(vars(args), f, sort_keys=True, indent=4)
+    # with open(os.path.join(args.work_dir, 'args.json'), 'w') as f:
+    #     json.dump(vars(args), f, sort_keys=True, indent=4)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
